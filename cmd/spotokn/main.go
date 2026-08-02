@@ -1,0 +1,208 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/botxlab/spotokn/internal"
+)
+
+const (
+	defaultPort         = 8080
+	readTimeout         = 15 * time.Second
+	writeTimeout        = 60 * time.Second // Increased from 10s to handle long metadata fetches
+	idleTimeout         = 120 * time.Second
+	errMethodNotAllowed = "Method not allowed"
+)
+
+type Server struct {
+	httpServer      *http.Server
+	tokenService    *internal.TokenService
+	metadataService *internal.MetadataService
+	logger          *internal.Logger
+}
+
+func NewServer() *Server {
+	logger := internal.NewLogger()
+	tokenService := internal.NewTokenService(logger)
+	metadataService := internal.NewMetadataService(logger)
+
+	mux := http.NewServeMux()
+	server := &Server{
+		tokenService:    tokenService,
+		metadataService: metadataService,
+		logger:          logger,
+	}
+
+	mux.HandleFunc("/api/token", server.handleToken)
+	mux.HandleFunc("/api/metadata", server.handleMetadata)
+	mux.HandleFunc("/health", server.handleHealth)
+	mux.HandleFunc("/", server.handleNotFound)
+
+	port := getEnvInt("PORT", defaultPort)
+	server.httpServer = &http.Server{
+		Addr:         ":" + strconv.Itoa(port),
+		Handler:      mux,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
+	}
+
+	return server
+}
+
+// GET /api/metadata?type=playlist|track|album|playlistMetadata|trackRecommender
+func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.respondError(w, http.StatusMethodNotAllowed, errMethodNotAllowed)
+		return
+	}
+
+	metadataType := r.URL.Query().Get("type")
+	if metadataType == "" {
+		s.respondError(w, http.StatusBadRequest, "Missing 'type' parameter")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
+	defer cancel()
+
+	s.logger.Infof("Fetching metadata for type: %s", metadataType)
+
+	result, err := s.metadataService.GetMetadata(ctx, metadataType)
+	if err != nil {
+		s.logger.Errorf("Metadata fetch failed for type '%s': %v", metadataType, err)
+		s.respondError(w, http.StatusServiceUnavailable, "Could not get metadata: "+err.Error())
+		return
+	}
+
+	s.logger.Infof("Successfully fetched metadata for type: %s", metadataType)
+	s.respondJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) Start() error {
+	port := s.httpServer.Addr
+	s.logger.Info("Spotify Token Service started on port " + port)
+	return s.httpServer.ListenAndServe()
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.logger.Info("Shutting down gracefully...")
+	s.tokenService.Cleanup()
+	s.metadataService.Cleanup()
+	err := s.httpServer.Shutdown(ctx)
+	if err == nil {
+		s.logger.Info("Shutdown complete")
+	}
+	return err
+}
+
+func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.respondError(w, http.StatusMethodNotAllowed, errMethodNotAllowed)
+		return
+	}
+
+	query := r.URL.Query()
+	debug := query.Get("debug") == "true"
+
+	if debug {
+		status := s.tokenService.GetStatus()
+		s.respondJSON(w, http.StatusOK, status)
+		return
+	}
+
+	cookies := parseCookies(r)
+	token, err := s.tokenService.GetToken(cookies)
+
+	if err != nil || token == nil {
+		s.logger.Error("Token fetch failed: " + err.Error())
+		s.respondError(w, http.StatusServiceUnavailable, "Service temporarily unavailable")
+		return
+	}
+
+	s.respondJSON(w, http.StatusOK, token)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.respondError(w, http.StatusMethodNotAllowed, errMethodNotAllowed)
+		return
+	}
+
+	health := map[string]interface{}{
+		"status":    "healthy",
+		"timestamp": time.Now().UnixMilli(),
+		"service":   "spotokn",
+	}
+	s.respondJSON(w, http.StatusOK, health)
+}
+
+func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	s.respondError(w, http.StatusNotFound, "Endpoint not found")
+}
+
+func (s *Server) respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		s.logger.Errorf("Failed to encode JSON response: %v", err)
+	}
+}
+
+func (s *Server) respondError(w http.ResponseWriter, status int, message string) {
+	s.respondJSON(w, status, map[string]interface{}{
+		"success":   false,
+		"error":     message,
+		"timestamp": time.Now().UnixMilli(),
+	})
+}
+
+func parseCookies(r *http.Request) []internal.Cookie {
+	cookies := []internal.Cookie{}
+	for _, c := range r.Cookies() {
+		cookies = append(cookies, internal.Cookie{
+			Name:  c.Name,
+			Value: c.Value,
+		})
+	}
+	return cookies
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.Atoi(val); err == nil {
+			return i
+		}
+	}
+	return defaultValue
+}
+
+func main() {
+	server := NewServer()
+
+	go func() {
+		if err := server.Start(); err != nil && err != http.ErrServerClosed {
+			server.logger.Error("Server error: " + err.Error())
+			os.Exit(1)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		server.logger.Error("Shutdown error: " + err.Error())
+		os.Exit(1)
+	}
+}
