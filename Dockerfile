@@ -25,7 +25,11 @@ FROM chromedp/headless-shell
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
 ENV BROWSER_BIN=/headless-shell/headless-shell
+ENV PORT=8080
+ENV HEADLESS=true
 
 COPY --from=build /app/spotokn /usr/local/bin/spotokn
+
+EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/spotokn"]
