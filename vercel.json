@@ -1,15 +1,15 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "Dockerfile",
-      "use": "@vercel/docker"
-    }
-  ],
+  "buildCommand": "go build -o api/handler ./cmd/spotokn",
+  "outputDirectory": "api",
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "/"
+      "dest": "/api/index"
     }
-  ]
+  ],
+  "functions": {
+    "api/index": {
+      "runtime": "go"
+    }
+  }
 }
